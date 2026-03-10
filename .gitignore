@@ -1,0 +1,26 @@
+# =============================================================================
+# .gitignore - Ansible Aruba Central Collection
+# =============================================================================
+
+# Vault files - NEVER commit credentials
+vault.yml
+*.vault
+.vault_pass
+
+# Ansible temporary files
+*.retry
+.ansible/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

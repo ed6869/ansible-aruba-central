@@ -1,0 +1,235 @@
+---
+# =============================================================================
+# onboarding.yml - HPE GLP Device Onboarding Playbook
+# =============================================================================
+# Prerequisites:
+#   - vault.yml must contain: glp_client_id, glp_client_secret, glp_central_sm_id
+#   - devices.yml must be filled with devices to onboard
+#
+# Usage:
+#   ansible-playbook onboarding.yml
+#   ansible-playbook onboarding.yml --ask-vault-pass  (if vault is encrypted)
+# =============================================================================
+
+- name: HPE GLP Device Onboarding
+  hosts: localhost
+  gather_facts: false
+
+  vars_files:
+    - vault.yml
+    - devices.yml
+
+  vars:
+    glp_auth_url: "https://sso.common.cloud.hpe.com"
+    glp_api_url:  "https://global.api.greenlake.hpe.com"
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # SUMMARY - Display devices to onboard
+    # -------------------------------------------------------------------------
+    - name: "Display devices to onboard"
+      debug:
+        msg: "Device: {{ item.serial_number }} | Type: {{ item.device_type }} | Site: {{ item.site }}"
+      loop: "{{ devices }}"
+
+    # -------------------------------------------------------------------------
+    # AUTHENTICATION - Get GLP access token
+    # -------------------------------------------------------------------------
+    - name: "GLP | Get access token"
+      uri:
+        url: "{{ glp_auth_url }}/as/token.oauth2"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          grant_type: "client_credentials"
+          client_id: "{{ glp_client_id }}"
+          client_secret: "{{ glp_client_secret }}"
+        status_code: 200
+      register: glp_auth
+      no_log: true
+
+    - name: "GLP | Store access token"
+      set_fact:
+        glp_token: "{{ glp_auth.json.access_token }}"
+      no_log: true
+
+    - name: "GLP | Authentication successful"
+      debug:
+        msg: "GLP authentication successful"
+
+    # -------------------------------------------------------------------------
+    # DEVICE CHECK - Verify device exists in GLP workspace, add if missing
+    # -------------------------------------------------------------------------
+    - name: "GLP | Check if device exists in workspace"
+      uri:
+        url: "{{ glp_api_url }}/devices/v1/devices?filter=serialNumber%20eq%20'{{ item.serial_number }}'"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ glp_token }}"
+        status_code: 200
+      loop: "{{ devices }}"
+      register: glp_devices_check
+
+    - name: "GLP | Store device existence status"
+      set_fact:
+        device_exists_map: >-
+          {{ device_exists_map | default({}) | combine({
+            item.item.serial_number: (item.json['total'] | int > 0)
+          }) }}
+      loop: "{{ glp_devices_check.results }}"
+
+    - name: "GLP | Display device existence status"
+      debug:
+        msg: "{{ item.key }}: {{ 'already in GLP workspace' if item.value else 'not found, will be added' }}"
+      loop: "{{ device_exists_map | dict2items }}"
+
+    - name: "GLP | Add missing devices to workspace"
+      uri:
+        url: "{{ glp_api_url }}/devices/v1/devices"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ glp_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          network:
+            - serialNumber: "{{ item.serial_number }}"
+              macAddress: "{{ item.mac_address }}"
+          compute: []
+          storage: []
+        status_code: [200, 202]
+      loop: "{{ devices }}"
+      when: not device_exists_map[item.serial_number]
+      register: glp_add_device
+
+    # -------------------------------------------------------------------------
+    # UUID MAPPING - Retrieve GLP device UUIDs from serial numbers
+    # -------------------------------------------------------------------------
+    - name: "GLP | Get device UUID from serial number"
+      uri:
+        url: "{{ glp_api_url }}/devices/v1/devices?filter=serialNumber%20eq%20'{{ item.serial_number }}'"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ glp_token }}"
+        status_code: 200
+      loop: "{{ devices }}"
+      register: glp_devices
+
+    - name: "GLP | Store device UUID mapping"
+      set_fact:
+        device_uuid_map: >-
+          {{ device_uuid_map | default({}) | combine({
+            item.item.serial_number: item.json['items'][0]['id']
+          }) }}
+      loop: "{{ glp_devices.results }}"
+
+    - name: "GLP | Display device UUID mapping"
+      debug:
+        msg: "{{ item.key }} -> {{ item.value }}"
+      loop: "{{ device_uuid_map | dict2items }}"
+
+    # -------------------------------------------------------------------------
+    # APPLICATION ASSIGNMENT - Assign devices to HPE Aruba Networking Central
+    # -------------------------------------------------------------------------
+    - name: "GLP | Assign devices to application"
+      uri:
+        url: "{{ glp_api_url }}/devices/v1/devices?id={{ device_uuid_map[item.serial_number] }}"
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ glp_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          application:
+            id: "{{ glp_central_sm_id }}"
+          region: "{{ item.glp.region }}"
+        status_code: [200, 202]
+      loop: "{{ devices }}"
+      register: glp_app_assignment
+
+    - name: "GLP | Wait for application assignment to complete"
+      uri:
+        url: "{{ glp_api_url }}/devices/v1/async-operations/{{ item.json.transactionId }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ glp_token }}"
+        status_code: 200
+      loop: "{{ glp_app_assignment.results }}"
+      register: glp_app_status
+      until: glp_app_status.json.status in ['SUCCEEDED', 'FAILED']
+      retries: 10
+      delay: 5
+
+    - name: "GLP | Display application assignment status"
+      debug:
+        msg: "{{ item.item.item.serial_number }}: {{ item.json.status }}"
+      loop: "{{ glp_app_status.results }}"
+
+    # -------------------------------------------------------------------------
+    # SUBSCRIPTION ASSIGNMENT - Apply licenses to devices
+    # -------------------------------------------------------------------------
+    - name: "GLP | Get subscription list"
+      uri:
+        url: "{{ glp_api_url }}/subscriptions/v1/subscriptions?select=id,key"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ glp_token }}"
+        status_code: 200
+      register: glp_subscriptions
+
+    - name: "GLP | Store subscription ID mapping"
+      set_fact:
+        subscription_id_map: >-
+          {{ subscription_id_map | default({}) | combine({
+            item.key: item.id
+          }) }}
+      loop: "{{ glp_subscriptions.json['items'] }}"
+
+    - name: "GLP | Apply subscriptions to devices"
+      uri:
+        url: "{{ glp_api_url }}/devices/v1/devices?id={{ device_uuid_map[item.serial_number] }}"
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ glp_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          subscription:
+            - id: "{{ subscription_id_map[item.glp.subscription_key] }}"
+        status_code: [200, 202]
+      loop: "{{ devices }}"
+      register: glp_sub_assignment
+
+    - name: "GLP | Wait for subscription assignment to complete"
+      uri:
+        url: "{{ glp_api_url }}/devices/v1/async-operations/{{ item.json.transactionId }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ glp_token }}"
+        status_code: 200
+      loop: "{{ glp_sub_assignment.results }}"
+      register: glp_sub_status
+      until: glp_sub_status.json.status in ['SUCCEEDED', 'FAILED']
+      retries: 10
+      delay: 5
+
+    - name: "GLP | Display subscription assignment status"
+      debug:
+        msg: "{{ item.item.item.serial_number }}: {{ item.json.status }}"
+      loop: "{{ glp_sub_status.results }}"
+
+    # -------------------------------------------------------------------------
+    # SUMMARY
+    # -------------------------------------------------------------------------
+    - name: "GLP Onboarding complete"
+      debug:
+        msg:
+          - "================================================"
+          - "Device : {{ item.serial_number }}"
+          - "Type   : {{ item.device_type }}"
+          - "Site   : {{ item.site }}"
+          - "Group  : {{ item.device_group }}"
+          - "Status : DONE"
+          - "================================================"
+      loop: "{{ devices }}"
