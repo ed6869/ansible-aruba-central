@@ -27,3 +27,13 @@ devices:
     glp:
       region: eu-central
       subscription_key: E893F27D614F54F948
+
+  - serial_number: CNQBLPQ0FF
+    mac_address: e8:10:98:c7:01:82
+    device_type: AP
+    persona: Campus AP
+    device_group: Ansible_Onboarding
+    site: Ansible_Paris
+    glp:
+      region: eu-central
+      subscription_key: E5485D9BE251041329

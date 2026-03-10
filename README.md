@@ -79,34 +79,106 @@ Edit `devices.yml` — add one block per device:
 
 ```yaml
 devices:
-  - serial_number: SGxxxxxxx       # Found on the device label or via CLI
-    mac_address: xx:xx:xx:xx:xx:xx # Found on the device label or via CLI
-    device_type: SWITCH             # SWITCH, AP or GATEWAY
-    persona: Wired Access
+  - serial_number: SGxxxxxxx
+    mac_address: xx:xx:xx:xx:xx:xx
+    device_type: SWITCH
+    persona: Access Switch
     device_group: My_Group
     site: My_Site
     glp:
-      region: eu-central            # See supported regions below
-      subscription_key: Exxxxxxxxx  # Found in GLP portal → Subscriptions
+      region: eu-central
+      subscription_key: Exxxxxxxxx
 ```
+
+---
+
+## Input File Breakdown
+
+### Devices (required)
+
+Add one entry per device under the `devices` block.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `serial_number` | string | Yes | Device serial number |
+| `mac_address` | string | Yes | Device MAC address |
+| `device_type` | enum | Yes | `SWITCH`, `AP` or `GATEWAY` |
+| `persona` | string | Yes | Device role — see Persona Options below |
+| `device_group` | string | Yes | Target configuration group in Central |
+| `site` | string | Yes | Site assignment in Central |
+| `glp.region` | string | Yes | GLP deployment region — see supported regions below |
+| `glp.subscription_key` | string | Yes | Subscription key from GLP portal |
 
 **Where to find the Serial Number and MAC Address:**
 
-| Device type | Location |
-|---|---|
-| Access Points | Bottom of the device |
-| AOS-CX Switch | Pull-out tab on the device |
-| Gateways | Back of the device |
-
-Or via CLI:
-
-| Platform | Command |
-|---|---|
-| AOS-CX Switch | `show system` |
-| AOS10 | `show inventory` |
+| Device type | Physical location | CLI command |
+|---|---|---|
+| Access Points | Bottom of the device
+| AOS-CX Switch | Pull-out tab on the device
+| Gateways | Back of the device
 
 **Where to find the `subscription_key`:**  
 GLP portal → **Subscriptions** → copy the **Key** column value for the subscription matching the device model.
+
+---
+
+### Persona Options by Device Type
+
+| `device_type` | `persona` |
+|---|---|
+| `AP` | `Campus AP` |
+| `SWITCH` | `Access Switch` |
+| `SWITCH` | `Core Switch` |
+| `SWITCH` | `Aggregation Switch` |
+| `GATEWAY` | `Mobility Gateway` |
+
+---
+
+### Sites (optional)
+
+Only required if the site does not already exist in Central. If the site already exists, you may omit this block.
+
+Add site entries under the `sites` block in `devices.yml`:
+
+```yaml
+sites:
+  - name: My_Site
+    address: "1 rue de la Paix"
+    city: Paris
+    state: Ile-de-France
+    country: France
+    zipcode: "75001"
+    timezone: Europe/Paris
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `name` | string | Yes | Unique site name — must match the `site` value in the device entry |
+| `address` | string | Yes | Street address |
+| `city` | string | Yes | City name |
+| `state` | string | Yes | State or region |
+| `country` | string | Yes | Country name or ISO code |
+| `zipcode` | string | Yes | Postal code — wrap in quotes |
+| `timezone` | string | Yes | Timezone identifier (e.g., `Europe/Paris`, `America/Chicago`) |
+
+---
+
+### Device Groups (optional)
+
+Only required if the device group does not already exist in Central. If the group already exists, you may omit this block.
+
+Add device group entries under the `device_groups` block in `devices.yml`:
+
+```yaml
+device_groups:
+  - name: My_Group
+    device_type: SWITCH
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `name` | string | Yes | Group name — must match the `device_group` value in the device entry |
+| `device_type` | string | Yes | Device type for this group: `SWITCH`, `AP` or `GATEWAY` |
 
 ---
 
@@ -155,14 +227,6 @@ The playbook executes the following sequence for each device:
 ---
 
 ## Reference
-
-### Supported device types
-
-| `device_type` | `persona` |
-|---|---|
-| `SWITCH` | `Wired Access` |
-| `AP` | `Wireless Access` |
-| `GATEWAY` | `WAN Gateway` |
 
 ### Supported regions
 
