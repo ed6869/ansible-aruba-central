@@ -1,0 +1,5 @@
+# GLP Credentials
+---
+glp_client_id: "your-client-id-here"
+glp_client_secret: "your-client-secret-here"
+glp_central_sm_id: "your-service-manager-id-here"
