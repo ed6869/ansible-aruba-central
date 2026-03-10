@@ -98,13 +98,6 @@ devices:
 | AOS-CX Switch | Pull-out tab on the device |
 | Gateways | Back of the device |
 
-Or via CLI:
-
-| Platform | Command |
-|---|---|
-| AOS-CX Switch | `show system` |
-| AOS10 | `show inventory` |
-
 **Where to find the `subscription_key`:**  
 GLP portal → **Subscriptions** → copy the **Key** column value for the subscription matching the device model.
 
