@@ -113,9 +113,9 @@ Add one entry per device under the `devices` block.
 
 | Device type | Physical location | CLI command |
 |---|---|---|
-| Access Points | Bottom of the device
-| AOS-CX Switch | Pull-out tab on the device
-| Gateways | Back of the device
+| Access Points | Bottom of the device | `show inventory` |
+| AOS-CX Switch | Pull-out tab on the device | `show system` |
+| Gateways | Back of the device | `show inventory` |
 
 **Where to find the `subscription_key`:**  
 GLP portal → **Subscriptions** → copy the **Key** column value for the subscription matching the device model.
