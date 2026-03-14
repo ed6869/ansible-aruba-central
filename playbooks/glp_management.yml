@@ -1,0 +1,262 @@
+---
+# =============================================================================
+# glp_management.yml — HPE GreenLake Platform Device Management
+# =============================================================================
+# Manages GLP operations on devices already present in the workspace.
+# All operations require -e serials= for safety.
+#
+# Tags:
+#   [glp_tags]         Apply/update GLP tags on devices
+#   [glp_assign_app]   Assign Central application to devices   (serials required)
+#   [glp_unassign_app] Unassign Central application from devices (serials required)
+#   [glp_assign_sub]   Assign subscription to devices          (serials required)
+#   [glp_unassign_sub] Unassign subscription from devices      (serials required)
+#
+# Usage:
+#   # Apply/update tags
+#   ansible-playbook glp_management.yml --tags glp_tags -e serials=SG03KW500G
+#
+#   # Assign application
+#   ansible-playbook glp_management.yml --tags glp_assign_app -e serials=SG03KW500G
+#
+#   # Unassign application
+#   ansible-playbook glp_management.yml --tags glp_unassign_app -e serials=SG03KW500G
+#
+#   # Assign subscription
+#   ansible-playbook glp_management.yml --tags glp_assign_sub -e serials=SG03KW500G
+#
+#   # Unassign subscription
+#   ansible-playbook glp_management.yml --tags glp_unassign_sub -e "serials=SG03KW500G,CNQBLPQ0FF"
+# =============================================================================
+
+- name: HPE GreenLake Platform — Device Management
+  hosts: localhost
+  gather_facts: false
+  connection: local
+
+  vars_files:
+    - vault.yml
+    - devices.yml
+
+  vars:
+    glp_api_url: "https://global.api.greenlake.hpe.com"
+    _serial_list: "{{ serials.split(',') | map('trim') | list if serials is defined else [] }}"
+    target_devices: >-
+      {{ devices | selectattr('serial_number', 'in', _serial_list) | list
+         if _serial_list | length > 0 else [] }}
+
+  tasks:
+
+    # =========================================================================
+    # COMMON — Safety guard for destructive operations
+    # unassign_app and unassign_sub require explicit -e serials= 
+    # assign_app, assign_sub, glp_tags are safe — default to all devices
+    # =========================================================================
+    - name: "GLP | Assert serials is defined for unassign (safety check)"
+      assert:
+        that:
+          - serials is defined
+          - serials | length > 0
+        fail_msg: >-
+          ERROR: you must specify at least one device using -e serials=<SERIAL>[,<SERIAL>].
+          Example: ansible-playbook glp_management.yml --tags glp_unassign_app -e serials=SG03KW500G
+          This guard prevents accidentally unassigning all devices.
+        success_msg: "Target devices: {{ _serial_list | join(', ') }}"
+      tags: [never, glp_unassign_app, glp_unassign_sub]
+
+    - name: "GLP | Display target devices"
+      debug:
+        msg: "Device: {{ item.serial_number }} | Type: {{ item.device_type }}"
+      loop: "{{ target_devices if target_devices | length > 0 else devices }}"
+      loop_control:
+        label: "{{ item.serial_number }}"
+      tags: [glp_tags, glp_assign_app, glp_assign_sub]
+
+    - name: "GLP | Query device UUID"
+      workflow.aruba_central.glp_device:
+        base_url: "{{ glp_api_url }}"
+        client_id: "{{ central_client_id }}"
+        client_secret: "{{ central_client_secret }}"
+        state: query
+        serial_number: "{{ item.serial_number }}"
+      loop: "{{ target_devices if target_devices | length > 0 else devices }}"
+      loop_control:
+        label: "{{ item.serial_number }}"
+      register: _glp_query
+      tags: [glp_tags, glp_assign_app, glp_assign_sub]
+
+    - name: "GLP | Build device UUID map"
+      set_fact:
+        device_uuid_map: >-
+          {{ device_uuid_map | default({}) | combine({
+            item.serial_number: item.device_id
+          }) }}
+      loop: "{{ _glp_query.results }}"
+      loop_control:
+        label: "{{ item.serial_number }}"
+      when: item.device_id is defined
+      tags: [glp_tags, glp_assign_app, glp_assign_sub]
+
+    # =========================================================================
+    # GLP TAGS
+    # Apply/update key/value tags on GLP devices (idempotent)
+    # Only processes devices that have glp.tags defined in devices.yml
+    # =========================================================================
+    - name: "GLP | Apply tags to device"
+      workflow.aruba_central.glp_device:
+        base_url: "{{ glp_api_url }}"
+        client_id: "{{ central_client_id }}"
+        client_secret: "{{ central_client_secret }}"
+        state: present
+        serial_number: "{{ item.serial_number }}"
+        mac_address: "{{ item.mac_address }}"
+        tags: "{{ item.glp.tags }}"
+      loop: "{{ target_devices if target_devices | length > 0 else devices }}"
+      loop_control:
+        label: "{{ item.serial_number }}"
+      when: item.glp.tags is defined
+      register: glp_tags_results
+      tags: [glp_tags]
+
+    - name: "GLP | Display tag results"
+      debug:
+        msg: "{{ item.msg | default('skipped — no tags defined') }}"
+      loop: "{{ glp_tags_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.serial_number | default('?') }}"
+      tags: [glp_tags]
+
+    # =========================================================================
+    # ASSIGN CENTRAL APPLICATION
+    # =========================================================================
+    - name: "GLP | Assign Central application to device"
+      workflow.aruba_central.glp_application:
+        base_url: "{{ glp_api_url }}"
+        client_id: "{{ central_client_id }}"
+        client_secret: "{{ central_client_secret }}"
+        state: present
+        device_id: "{{ device_uuid_map[item.serial_number] }}"
+        serial_number: "{{ item.serial_number }}"
+        application_id: "{{ glp_central_sm_id }}"
+        region: "{{ item.glp.region }}"
+        retries: 10
+        delay: 5
+      loop: "{{ target_devices if target_devices | length > 0 else devices }}"
+      loop_control:
+        label: "{{ item.serial_number }}"
+      register: glp_assign_app_results
+      tags: [glp_assign_app]
+
+    - name: "GLP | Display application assignment results"
+      debug:
+        msg: "{{ item.msg }}"
+      loop: "{{ glp_assign_app_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.serial_number }}"
+      tags: [glp_assign_app]
+
+    # =========================================================================
+    # UNASSIGN CENTRAL APPLICATION
+    # =========================================================================
+    - name: "GLP | Query device UUID (unassign)"
+      workflow.aruba_central.glp_device:
+        base_url: "{{ glp_api_url }}"
+        client_id: "{{ central_client_id }}"
+        client_secret: "{{ central_client_secret }}"
+        state: query
+        serial_number: "{{ item.serial_number }}"
+      loop: "{{ target_devices }}"
+      loop_control:
+        label: "{{ item.serial_number }}"
+      register: _glp_query_unassign
+      tags: [never, glp_unassign_app, glp_unassign_sub]
+
+    - name: "GLP | Build device UUID map (unassign)"
+      set_fact:
+        device_uuid_map: >-
+          {{ device_uuid_map | default({}) | combine({
+            item.serial_number: item.device_id
+          }) }}
+      loop: "{{ _glp_query_unassign.results }}"
+      loop_control:
+        label: "{{ item.serial_number }}"
+      when: item.device_id is defined
+      tags: [never, glp_unassign_app, glp_unassign_sub]
+
+    - name: "GLP | Unassign Central application from device"
+      workflow.aruba_central.glp_application:
+        base_url: "{{ glp_api_url }}"
+        client_id: "{{ central_client_id }}"
+        client_secret: "{{ central_client_secret }}"
+        state: absent
+        device_id: "{{ device_uuid_map[item.serial_number] }}"
+        serial_number: "{{ item.serial_number }}"
+        application_id: "{{ glp_central_sm_id }}"
+        region: "{{ item.glp.region }}"
+      loop: "{{ target_devices if target_devices | length > 0 else devices }}"
+      loop_control:
+        label: "{{ item.serial_number }}"
+      register: glp_unassign_app_results
+      tags: [never, glp_unassign_app]
+
+    - name: "GLP | Display application unassignment results"
+      debug:
+        msg: "{{ item.msg }}"
+      loop: "{{ glp_unassign_app_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.serial_number }}"
+      tags: [never, glp_unassign_app]
+
+    # =========================================================================
+    # ASSIGN SUBSCRIPTION
+    # =========================================================================
+    - name: "GLP | Assign subscription to device"
+      workflow.aruba_central.glp_license:
+        base_url: "{{ glp_api_url }}"
+        client_id: "{{ central_client_id }}"
+        client_secret: "{{ central_client_secret }}"
+        state: present
+        device_id: "{{ device_uuid_map[item.serial_number] }}"
+        serial_number: "{{ item.serial_number }}"
+        subscription_key: "{{ item.glp.subscription_key }}"
+        retries: 10
+        delay: 5
+      loop: "{{ target_devices if target_devices | length > 0 else devices }}"
+      loop_control:
+        label: "{{ item.serial_number }}"
+      register: glp_assign_sub_results
+      tags: [glp_assign_sub]
+
+    - name: "GLP | Display subscription assignment results"
+      debug:
+        msg: "{{ item.msg }}"
+      loop: "{{ glp_assign_sub_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.serial_number }}"
+      tags: [glp_assign_sub]
+
+    # =========================================================================
+    # UNASSIGN SUBSCRIPTION
+    # =========================================================================
+    - name: "GLP | Unassign subscription from device"
+      workflow.aruba_central.glp_license:
+        base_url: "{{ glp_api_url }}"
+        client_id: "{{ central_client_id }}"
+        client_secret: "{{ central_client_secret }}"
+        state: absent
+        device_id: "{{ device_uuid_map[item.serial_number] }}"
+        serial_number: "{{ item.serial_number }}"
+        subscription_key: "{{ item.glp.subscription_key }}"
+      loop: "{{ target_devices if target_devices | length > 0 else devices }}"
+      loop_control:
+        label: "{{ item.serial_number }}"
+      register: glp_unassign_sub_results
+      tags: [never, glp_unassign_sub]
+
+    - name: "GLP | Display subscription unassignment results"
+      debug:
+        msg: "{{ item.msg }}"
+      loop: "{{ glp_unassign_sub_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.serial_number }}"
+      tags: [never, glp_unassign_sub]

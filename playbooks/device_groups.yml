@@ -1,0 +1,18 @@
+---
+# =============================================================================
+# device_groups.yml
+# Input file defining device groups to manage in Classic Central
+# =============================================================================
+
+# Groups to create
+# ansible-playbook device_group_management.yml --tags create
+device_groups:
+  - name: "Ansible_Onboarding"
+    allowed_dev_types: ["AccessPoints", "Gateways", "Switches"]
+    allowed_switch_types: ["AOS_CX"]
+    architecture: "AOS10"
+    ap_network_role: "Standard"
+    gw_network_role: "WLANGateway"
+    template_wired: false
+    template_wireless: false
+    new_central: true

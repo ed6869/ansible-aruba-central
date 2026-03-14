@@ -1,0 +1,275 @@
+---
+# =============================================================================
+# device_group_management.yml — Device Group Management
+# =============================================================================
+# Manages device groups and device-to-group assignments in Classic Central.
+#
+# Tags:
+#   [create_group]  Create groups from device_groups.yml (idempotent, target_group_names optional)
+#   [update_group]  Update group properties              (target_group_names required)
+#   [delete_group]  Delete groups                        (target_group_names required)
+#
+# Usage:
+#   # Create all groups (idempotent)
+#   ansible-playbook device_group_management.yml --tags create_group
+#
+#   # Create a single group
+#   ansible-playbook device_group_management.yml --tags create_group -e target_group_names=Ansible_Onboarding
+#
+#   # Update group properties (target_group_names required)
+#   ansible-playbook device_group_management.yml --tags update_group -e target_group_names=Ansible_Onboarding
+#
+#   # Delete a group (target_group_names required)
+#   ansible-playbook device_group_management.yml --tags delete_group -e target_group_names=Ansible_Onboarding
+#
+#   # Move all devices into their group
+#
+#   # Move specific devices into their group
+# =============================================================================
+
+- name: HPE Aruba Classic Central — Device Group Management
+  hosts: localhost
+  gather_facts: false
+  connection: local
+
+  vars_files:
+    - vault.yml
+    - device_groups.yml
+    - devices.yml
+
+  vars:
+    classic_central_base_url: "https://eu-apigw.central.arubanetworks.com"
+    vault_file:               "{{ playbook_dir }}/vault.yml"
+    vault_encrypted:          false
+
+    _group_list: "{{ (target_group_names | string).split(',') | map('trim') | list if target_group_names is defined else [] }}"
+    target_groups: >-
+      {{ device_groups | selectattr('name', 'in', _group_list) | list
+         if _group_list | length > 0 else device_groups }}
+
+
+  tasks:
+
+    # =========================================================================
+    # CLASSIC CENTRAL AUTH + GROUP QUERY
+    # PRE-FLIGHT — Sync refresh token from file to var if available
+    # Prevents using a stale vault token when /tmp/.central_refresh_token exists
+    # =========================================================================
+    - name: "Classic Central | Check if token file exists"
+      stat:
+        path: "/tmp/.central_refresh_token"
+      register: _token_file_stat
+      tags: [create_group]
+
+    - name: "Classic Central | Load token from file if available"
+      set_fact:
+        classic_central_refresh_token: "{{ lookup('file', '/tmp/.central_refresh_token') | trim }}"
+      when: _token_file_stat.stat.exists | default(false)
+      tags: [create_group]
+
+    # =========================================================================
+    # Single auth call shared by create_group and assign_group
+    # =========================================================================
+    - name: "Classic Central | Query device groups"
+      workflow.aruba_central.central_device_group:
+        base_url: "{{ classic_central_base_url }}"
+        state: query
+        client_id: "{{ classic_central_client_id }}"
+        client_secret: "{{ classic_central_client_secret }}"
+        customer_id: "{{ classic_central_customer_id }}"
+        refresh_token: "{{ classic_central_refresh_token | default('') }}"
+        username: "{{ classic_central_username | default(omit) }}"
+        password: "{{ classic_central_password | default(omit) }}"
+      register: dg_query
+      tags: [create_group]
+
+    - name: "Classic Central | Display existing groups"
+      debug:
+        msg: "{{ dg_query.total }} group(s) found: {{ dg_query.group_names }}"
+      tags: [create_group]
+
+    # =========================================================================
+    # CREATE GROUP (idempotent — skips existing groups)
+    # Skip with --skip-tags create_group if all groups already exist
+    # target_group_names optional — defaults to all groups from device_groups.yml
+    # =========================================================================
+    - name: "Classic Central | Create device group (if not exists)"
+      workflow.aruba_central.central_device_group:
+        base_url: "{{ classic_central_base_url }}"
+        state: present
+        client_id: "{{ classic_central_client_id }}"
+        client_secret: "{{ classic_central_client_secret }}"
+        customer_id: "{{ classic_central_customer_id }}"
+        refresh_token: "{{ lookup('file', '/tmp/.central_refresh_token') | default('') }}"
+        username: "{{ classic_central_username | default(omit) }}"
+        password: "{{ classic_central_password | default(omit) }}"
+        group_name: "{{ item.name }}"
+        allowed_dev_types: "{{ item.allowed_dev_types | default(['AccessPoints', 'Gateways', 'Switches']) }}"
+        allowed_switch_types: "{{ item.allowed_switch_types | default(['AOS_CX']) }}"
+        architecture: "{{ item.architecture | default('AOS10') }}"
+        ap_network_role: "{{ item.ap_network_role | default('Standard') }}"
+        gw_network_role: "{{ item.gw_network_role | default('WLANGateway') }}"
+        template_wired: "{{ item.template_wired | default(false) }}"
+        template_wireless: "{{ item.template_wireless | default(false) }}"
+        new_central: "{{ item.new_central | default(true) }}"
+      loop: "{{ target_groups }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: dg_create_results
+      tags: [create_group]
+
+    - name: "Display device group creation results"
+      debug:
+        msg: "{{ item.msg }}"
+      loop: "{{ dg_create_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      tags: [create_group]
+
+    # =========================================================================
+    # UPDATE GROUP — target_group_names required
+    # Only adding new device types is permitted by the API
+    # =========================================================================
+    - name: "Central | Assert target_group_names is defined for update (safety check)"
+      assert:
+        that:
+          - target_group_names is defined
+          - target_group_names | length > 0
+        fail_msg: >-
+          ERROR: you must specify at least one group using -e target_group_names=<GROUP_NAME>[,<GROUP_NAME>].
+          Example: ansible-playbook device_group_management.yml --tags update_group -e target_group_names=Ansible_Onboarding
+          This guard prevents accidentally updating all groups.
+        success_msg: "Target groups: {{ _group_list | join(', ') }}"
+      tags: [never, update_group]
+
+    - name: "Classic Central | Auth for update"
+      workflow.aruba_central.central_device_group:
+        base_url: "{{ classic_central_base_url }}"
+        state: query
+        client_id: "{{ classic_central_client_id }}"
+        client_secret: "{{ classic_central_client_secret }}"
+        customer_id: "{{ classic_central_customer_id }}"
+        refresh_token: "{{ lookup('file', '/tmp/.central_refresh_token') | default('') }}"
+        username: "{{ classic_central_username | default(omit) }}"
+        password: "{{ classic_central_password | default(omit) }}"
+      register: _dg_query_update
+      tags: [never, update_group]
+
+    - name: "Classic Central | Update device group properties"
+      workflow.aruba_central.central_device_group:
+        base_url: "{{ classic_central_base_url }}"
+        state: updated
+        client_id: "{{ classic_central_client_id }}"
+        client_secret: "{{ classic_central_client_secret }}"
+        customer_id: "{{ classic_central_customer_id }}"
+        refresh_token: "{{ lookup('file', '/tmp/.central_refresh_token') | default('') }}"
+        username: "{{ classic_central_username | default(omit) }}"
+        password: "{{ classic_central_password | default(omit) }}"
+        group_name: "{{ item.name }}"
+        allowed_dev_types: "{{ item.allowed_dev_types | default(['AccessPoints', 'Gateways', 'Switches']) }}"
+        allowed_switch_types: "{{ item.allowed_switch_types | default(['AOS_CX']) }}"
+        architecture: "{{ item.architecture | default('AOS10') }}"
+        ap_network_role: "{{ item.ap_network_role | default('Standard') }}"
+        gw_network_role: "{{ item.gw_network_role | default('WLANGateway') }}"
+        template_wired: "{{ item.template_wired | default(false) }}"
+        template_wireless: "{{ item.template_wireless | default(false) }}"
+        new_central: "{{ item.new_central | default(true) }}"
+      loop: "{{ target_groups }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: dg_update_results
+      tags: [never, update_group]
+
+    - name: "Display device group update results"
+      debug:
+        msg: "{{ item.msg }}"
+      loop: "{{ dg_update_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      tags: [never, update_group]
+
+    # =========================================================================
+    # DELETE GROUP — target_group_names required
+    # =========================================================================
+    - name: "Central | Assert target_group_names is defined for delete (safety check)"
+      assert:
+        that:
+          - target_group_names is defined
+          - target_group_names | length > 0
+        fail_msg: >-
+          ERROR: you must specify at least one group using -e target_group_names=<GROUP_NAME>[,<GROUP_NAME>].
+          Example: ansible-playbook device_group_management.yml --tags delete_group -e target_group_names=Ansible_Onboarding
+          This guard prevents accidentally deleting all groups.
+        success_msg: "Target groups: {{ _group_list | join(', ') }}"
+      tags: [never, delete_group]
+
+    - name: "Classic Central | Auth for delete"
+      workflow.aruba_central.central_device_group:
+        base_url: "{{ classic_central_base_url }}"
+        state: query
+        client_id: "{{ classic_central_client_id }}"
+        client_secret: "{{ classic_central_client_secret }}"
+        customer_id: "{{ classic_central_customer_id }}"
+        refresh_token: "{{ lookup('file', '/tmp/.central_refresh_token') | default('') }}"
+        username: "{{ classic_central_username | default(omit) }}"
+        password: "{{ classic_central_password | default(omit) }}"
+      register: _dg_query_delete
+      tags: [never, delete_group]
+
+    - name: "Classic Central | Delete device group"
+      workflow.aruba_central.central_device_group:
+        base_url: "{{ classic_central_base_url }}"
+        state: absent
+        client_id: "{{ classic_central_client_id }}"
+        client_secret: "{{ classic_central_client_secret }}"
+        customer_id: "{{ classic_central_customer_id }}"
+        refresh_token: "{{ lookup('file', '/tmp/.central_refresh_token') | default('') }}"
+        username: "{{ classic_central_username | default(omit) }}"
+        password: "{{ classic_central_password | default(omit) }}"
+        group_name: "{{ item.name }}"
+      loop: "{{ target_groups }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: dg_delete_results
+      tags: [never, delete_group]
+
+    - name: "Display device group deletion results"
+      debug:
+        msg: "{{ item.msg }}"
+      loop: "{{ dg_delete_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      tags: [never, delete_group]
+
+    # =========================================================================
+    # SAVE REFRESH TOKEN
+    # =========================================================================
+    - name: "Read new refresh token from temp file"
+      slurp:
+        src: "/tmp/.central_refresh_token"
+      register: _token_file
+      tags: [create_group, update_group, delete_group]
+
+    - name: "Set new refresh token fact"
+      set_fact:
+        _new_refresh_token: "{{ _token_file.content | b64decode | trim }}"
+      tags: [create_group, update_group, delete_group]
+
+    - name: "Vault | Decrypt vault.yml"
+      command: ansible-vault decrypt {{ vault_file }} --vault-password-file {{ vault_password_file }}
+      changed_when: false
+      when: vault_encrypted | bool
+      tags: [create_group, update_group, delete_group]
+
+    - name: "Vault | Update classic_central_refresh_token in vault.yml"
+      replace:
+        path: "{{ vault_file }}"
+        regexp: '^classic_central_refresh_token:.*$'
+        replace: 'classic_central_refresh_token: "{{ _new_refresh_token }}"'
+      tags: [create_group, update_group, delete_group]
+
+    - name: "Vault | Re-encrypt vault.yml"
+      command: ansible-vault encrypt {{ vault_file }} --vault-password-file {{ vault_password_file }}
+      changed_when: false
+      when: vault_encrypted | bool
+      tags: [create_group, update_group, delete_group]

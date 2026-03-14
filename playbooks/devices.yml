@@ -1,0 +1,52 @@
+---
+# =============================================================================
+# devices.yml - Input file for GLP Onboarding
+# =============================================================================
+# Fill in one block per device to onboard.
+# Each device must have its own subscription_key (found in GLP portal).
+# Supported device_type values: SWITCH, AP, GATEWAY
+#
+# glp.tags (optional): Key/value pairs applied to the device in GLP.
+#   Set a value to null to remove a tag.
+#   Tags are searchable/filterable in the GLP portal.
+# =============================================================================
+
+devices:
+  - serial_number: SG03KW500G
+    mac_address: b8:d4:e7:0d:52:40
+    device_type: SWITCH
+    persona: ACCESS_SWITCH
+    device_group: Ansible_Onboarding
+    site: Paris-HQ
+    glp:
+      region: eu-central
+      subscription_key: E6FF23F6C1986469AB
+      # tags:
+      #   managed_by: ansible
+      #   environment: production
+
+  - serial_number: SG3ALN0004
+    mac_address: 5c:a4:7d:25:30:00
+    device_type: SWITCH
+    persona: ACCESS_SWITCH
+    device_group: Ansible_Onboarding
+    site: Paris-HQ
+    glp:
+      region: eu-central
+      subscription_key: E893F27D614F54F948
+      # tags:
+      #   managed_by: ansible
+      #   environment: production
+
+  - serial_number: CNQBLPQ0FF
+    mac_address: e8:10:98:c7:01:82
+    device_type: AP
+    persona: CAMPUS_AP
+    device_group: Ansible_Onboarding
+    site: Lyon-Branch
+    glp:
+      region: eu-central
+      subscription_key: E5485D9BE251041329
+      # tags:
+      #   managed_by: ansible
+      #   environment: production

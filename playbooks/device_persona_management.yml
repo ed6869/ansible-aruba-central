@@ -1,0 +1,108 @@
+---
+# =============================================================================
+# device_persona_management.yml — Device Persona Assignment
+# =============================================================================
+# Assigns device personas (device functions) via HPE Aruba New Central API.
+# Uses GLP/New Central OAuth2 — no Classic Central, no rate limit concern.
+#
+# Tags:
+#   [assign_persona] Assign persona to devices (serials optional)
+#
+# Usage:
+#   # Assign persona to all devices
+#   ansible-playbook device_persona_management.yml --tags assign_persona
+#
+#   # Assign persona to a single device
+#   ansible-playbook device_persona_management.yml --tags assign_persona -e serials=SG03KW500G
+#
+#   # Assign persona to multiple devices
+#   ansible-playbook device_persona_management.yml --tags assign_persona -e "serials=SG03KW500G,CNQBLPQ0FF"
+# =============================================================================
+
+- name: HPE Aruba New Central — Device Persona Assignment
+  hosts: localhost
+  gather_facts: false
+  connection: local
+
+  vars_files:
+    - vault.yml
+    - devices.yml
+
+  vars:
+    new_central_base_url: "https://de1.api.central.arubanetworks.com"
+    _serial_list: "{{ serials.split(',') | map('trim') | list if serials is defined else [] }}"
+    target_devices: >-
+      {{ devices | selectattr('serial_number', 'in', _serial_list) | list
+         if _serial_list | length > 0 else [] }}
+
+  tasks:
+
+    # =========================================================================
+    # ASSIGN PERSONA
+    # Groups devices by persona to minimize API calls
+    # One API call per persona type instead of one per device
+    # serials optional — defaults to all devices if not specified
+    # =========================================================================
+    - name: "Write device persona grouping script"
+      copy:
+        dest: "/tmp/group_personas.py"
+        content: |
+          #!/usr/bin/env python3
+          import json
+          with open('/tmp/devices_persona.json') as f:
+              devices = json.load(f)
+          groups = {}
+          for d in devices:
+              persona = d.get('persona')
+              if not persona:
+                  continue
+              groups.setdefault(persona, []).append(str(d['serial_number']))
+          result = [{'persona': k, 'serials': v} for k, v in groups.items()]
+          print(json.dumps({'groups': result}))
+        mode: '0755'
+      tags: [assign_persona]
+
+    - name: "Write devices to JSON for persona grouping"
+      copy:
+        dest: "/tmp/devices_persona.json"
+        content: "{{ (target_devices if target_devices | length > 0 else devices) | to_json }}"
+      tags: [assign_persona]
+
+    - name: "Run persona grouping script"
+      command: python3 /tmp/group_personas.py
+      register: persona_groups_raw
+      tags: [assign_persona]
+
+    - name: "Set persona_groups fact"
+      set_fact:
+        persona_groups: "{{ (persona_groups_raw.stdout | from_json).groups }}"
+      tags: [assign_persona]
+
+    - name: "Display persona groups"
+      debug:
+        msg: "Persona: {{ item.persona }} | Devices: {{ item.serials | join(', ') }}"
+      loop: "{{ persona_groups }}"
+      loop_control:
+        label: "{{ item.persona }}"
+      tags: [assign_persona]
+
+    - name: "New Central | Assign device persona"
+      workflow.aruba_central.central_device_persona:
+        base_url: "{{ new_central_base_url }}"
+        client_id: "{{ central_client_id }}"
+        client_secret: "{{ central_client_secret }}"
+        device_serials: "{{ item.serials }}"
+        persona: "{{ item.persona }}"
+      loop: "{{ persona_groups }}"
+      loop_control:
+        label: "{{ item.persona }}"
+      register: persona_results
+      tags: [assign_persona]
+
+    - name: "Display persona assignment results"
+      debug:
+        msg: "{{ item.msg }}"
+      loop: "{{ persona_results.results }}"
+      loop_control:
+        label: "{{ item.item.persona }}"
+      tags: [assign_persona]

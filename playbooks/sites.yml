@@ -1,0 +1,25 @@
+---
+# sites.yml - List of sites to create in HPE Aruba Central
+# timezone   : IANA format (https://en.wikipedia.org/wiki/List_of_tz_database_time_zones)
+# state_region: region/state without spaces (e.g. Ile-de-France, Rhone-Alpes)
+
+sites:
+  - site_name: "Paris-HQ"
+    address: "1 Rue de la Paix"
+    city: "Paris"
+    state_region: "Ile-de-France"
+    country: "France"
+    zip_code: "75001"
+    #latitude: 48.8698    # optional
+    #longitude: 2.3309    # optional
+    timezone: "Europe/Paris"
+
+  - site_name: "Lyon-Branch"
+    address: "10 Place Bellecour"
+    city: "Lyon"
+    state_region: "Rhone-Alpes"
+    country: "France"
+    zip_code: "69002"
+    #latitude: 45.7579    # optional
+    #longitude: 4.832     # optional
+    timezone: "Europe/Paris"

@@ -1,0 +1,312 @@
+---
+# =============================================================================
+# site_management.yml — HPE Aruba Central Site Management
+# =============================================================================
+# Manages site lifecycle and device-site associations in Aruba Central.
+#
+# Tags:
+#   [create_site]   Create sites from sites.yml (idempotent, site_names optional)
+#   [update_site]   Update site details          (site_names required)
+#   [delete_site]   Delete sites                 (site_names required)
+#   [assign_site]   Associate devices to site    (serials optional)
+#   [unassign_site] Remove devices from site     (serials required)
+#
+# Usage:
+#   # Create all sites
+#   ansible-playbook site_management.yml --tags create_site
+#
+#   # Create a single site
+#   ansible-playbook site_management.yml --tags create_site -e site_names=Paris-HQ
+#
+#   # Update site details
+#   ansible-playbook site_management.yml --tags update_site -e site_names=Paris-HQ
+#
+#   # Delete a site
+#   ansible-playbook site_management.yml --tags delete_site -e site_names=Lyon-Branch
+#
+#   # Associate all devices to their site
+#   ansible-playbook site_management.yml --tags assign_site
+#
+#   # Associate a single device
+#   ansible-playbook site_management.yml --tags assign_site -e serials=SG03KW500G
+#
+#   # Remove devices from their site
+#   ansible-playbook site_management.yml --tags unassign_site -e "serials=SG03KW500G,CNQBLPQ0FF"
+# =============================================================================
+
+- name: HPE Aruba Central — Site Management
+  hosts: localhost
+  gather_facts: false
+  connection: local
+
+  vars_files:
+    - vault.yml
+    - devices.yml
+    - sites.yml
+
+  vars:
+    new_central_base_url:     "https://de1.api.central.arubanetworks.com"
+    classic_central_base_url: "https://eu-apigw.central.arubanetworks.com"
+    vault_file:               "{{ playbook_dir }}/vault.yml"
+    vault_encrypted:          false
+    _serial_list: "{{ serials.split(',') | map('trim') | list if serials is defined else [] }}"
+    target_devices: >-
+      {{ devices | selectattr('serial_number', 'in', _serial_list) | list
+         if _serial_list | length > 0 else [] }}
+    _site_list: "{{ site_names.split(',') | map('trim') | list if site_names is defined else [] }}"
+    target_sites: >-
+      {{ sites | selectattr('site_name', 'in', _site_list) | list
+         if _site_list | length > 0 else sites }}
+
+
+  tasks:
+
+    # =========================================================================
+    # CLASSIC CENTRAL AUTH + SITE LOOKUP
+    # PRE-FLIGHT — Sync refresh token from file to var if available
+    # Prevents using a stale vault token when /tmp/.central_refresh_token exists
+    # =========================================================================
+    - name: "Classic Central | Check if token file exists"
+      stat:
+        path: "/tmp/.central_refresh_token"
+      register: _token_file_stat
+      tags: [create_site]
+
+    - name: "Classic Central | Load token from file if available"
+      set_fact:
+        classic_central_refresh_token: "{{ lookup('file', '/tmp/.central_refresh_token') | trim }}"
+      when: _token_file_stat.stat.exists | default(false)
+      tags: [create_site]
+
+    # =========================================================================
+    # Single auth call shared by create_site, assign_site, unassign_site
+    # =========================================================================
+    - name: "Classic Central | Query sites"
+      workflow.aruba_central.central_site_devices:
+        base_url: "{{ classic_central_base_url }}"
+        state: query
+        client_id: "{{ classic_central_client_id }}"
+        client_secret: "{{ classic_central_client_secret }}"
+        customer_id: "{{ classic_central_customer_id }}"
+        refresh_token: "{{ classic_central_refresh_token | default('') }}"
+        username: "{{ classic_central_username | default(omit) }}"
+        password: "{{ classic_central_password | default(omit) }}"
+      register: sites_query
+      tags: [create_site]
+
+    - name: "Classic Central | Build site name -> site_id lookup"
+      set_fact:
+        classic_site_id_map: "{{ sites_query.sites | items2dict(key_name='site_name', value_name='site_id') }}"
+      tags: [create_site]
+
+    - name: "Classic Central | Display site lookup map"
+      debug:
+        msg: "Site map: {{ classic_site_id_map }}"
+      tags: [create_site]
+
+    # =========================================================================
+    # CREATE SITE (idempotent)
+    # =========================================================================
+    - name: "Classic Central | Create site (if not exists)"
+      workflow.aruba_central.central_site:
+        base_url: "{{ new_central_base_url }}"
+        client_id: "{{ central_client_id }}"
+        client_secret: "{{ central_client_secret }}"
+        state: present
+        site_name: "{{ item.site_name }}"
+        address: "{{ item.address | default(omit) }}"
+        city: "{{ item.city | default(omit) }}"
+        state_region: "{{ item.state_region | default(omit) }}"
+        country: "{{ item.country | default(omit) }}"
+        zip_code: "{{ item.zip_code | default(omit) }}"
+        timezone: "{{ item.timezone | default('UTC') }}"
+        latitude: "{{ item.latitude | default(omit) }}"
+        longitude: "{{ item.longitude | default(omit) }}"
+      loop: "{{ target_sites }}"
+      loop_control:
+        label: "{{ item.site_name }}"
+      when: item.site_name not in classic_site_id_map
+      register: site_create_results
+      tags: [create_site]
+
+    - name: "Classic Central | Display site creation results"
+      debug:
+        msg: "{{ item.msg | default('skipped') }}"
+      loop: "{{ site_create_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item | default('') }}"
+      when: site_create_results.results is defined and item.msg is defined
+      tags: [create_site]
+
+    # Re-query only if at least one site was actually created
+    - name: "Classic Central | Re-query sites after creation"
+      workflow.aruba_central.central_site_devices:
+        base_url: "{{ classic_central_base_url }}"
+        state: query
+        client_id: "{{ classic_central_client_id }}"
+        client_secret: "{{ classic_central_client_secret }}"
+        customer_id: "{{ classic_central_customer_id }}"
+        refresh_token: "{{ lookup('file', '/tmp/.central_refresh_token') | default('') }}"
+        username: "{{ classic_central_username | default(omit) }}"
+        password: "{{ classic_central_password | default(omit) }}"
+      register: sites_query
+      when: site_create_results.results | default([]) | selectattr('changed', 'equalto', true) | list | length > 0
+      tags: [create_site]
+
+    - name: "Classic Central | Rebuild site name -> site_id lookup"
+      set_fact:
+        classic_site_id_map: "{{ sites_query.sites | items2dict(key_name='site_name', value_name='site_id') }}"
+      when: site_create_results.results | default([]) | selectattr('changed', 'equalto', true) | list | length > 0
+      tags: [create_site]
+
+    # =========================================================================
+    # UPDATE SITE — site_names required
+    # =========================================================================
+    - name: "Central | Assert site_names is defined for update (safety check)"
+      assert:
+        that:
+          - site_names is defined
+          - site_names | length > 0
+        fail_msg: >-
+          ERROR: you must specify at least one site using -e site_names=<SITE_NAME>[,<SITE_NAME>].
+          Example: ansible-playbook site_management.yml --tags update_site -e site_names=Paris-HQ
+        success_msg: "Target sites: {{ _site_list | join(', ') }}"
+      tags: [never, update_site]
+
+    - name: "New Central | Query sites to resolve scope_id (update)"
+      workflow.aruba_central.central_site:
+        base_url: "{{ new_central_base_url }}"
+        client_id: "{{ central_client_id }}"
+        client_secret: "{{ central_client_secret }}"
+        state: query
+        limit: 100
+      register: _sites_for_update
+      tags: [never, update_site]
+
+    - name: "New Central | Build site_name -> scope_id map (update)"
+      set_fact:
+        _site_scope_map: >-
+          {{ _sites_for_update.sites
+             | items2dict(key_name='scopeName', value_name='scopeId') }}
+      tags: [never, update_site]
+
+    - name: "New Central | Update site"
+      workflow.aruba_central.central_site:
+        base_url: "{{ new_central_base_url }}"
+        client_id: "{{ central_client_id }}"
+        client_secret: "{{ central_client_secret }}"
+        state: update
+        scope_id: "{{ _site_scope_map[item.site_name] }}"
+        site_name: "{{ item.site_name }}"
+        address: "{{ item.address | default(omit) }}"
+        city: "{{ item.city | default(omit) }}"
+        state_region: "{{ item.state_region | default(omit) }}"
+        country: "{{ item.country | default(omit) }}"
+        zip_code: "{{ item.zip_code | default(omit) }}"
+        timezone: "{{ item.timezone | default('UTC') }}"
+        latitude: "{{ item.latitude | default(omit) }}"
+        longitude: "{{ item.longitude | default(omit) }}"
+      loop: "{{ target_sites }}"
+      loop_control:
+        label: "{{ item.site_name }}"
+      when: item.site_name in _site_scope_map
+      register: site_update_results
+      tags: [never, update_site]
+
+    - name: "New Central | Display site update results"
+      debug:
+        msg: "{{ item.msg }}"
+      loop: "{{ site_update_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.site_name }}"
+      when: site_update_results.results is defined
+      tags: [never, update_site]
+
+    # =========================================================================
+    # DELETE SITE — site_names required
+    # =========================================================================
+    - name: "Central | Assert site_names is defined for delete (safety check)"
+      assert:
+        that:
+          - site_names is defined
+          - site_names | length > 0
+        fail_msg: >-
+          ERROR: you must specify at least one site using -e site_names=<SITE_NAME>[,<SITE_NAME>].
+          Example: ansible-playbook site_management.yml --tags delete_site -e site_names=Paris-HQ
+          This guard prevents accidentally deleting all sites.
+        success_msg: "Target sites: {{ _site_list | join(', ') }}"
+      tags: [never, delete_site]
+
+    - name: "New Central | Query sites to resolve scope_id (delete)"
+      workflow.aruba_central.central_site:
+        base_url: "{{ new_central_base_url }}"
+        client_id: "{{ central_client_id }}"
+        client_secret: "{{ central_client_secret }}"
+        state: query
+        limit: 100
+      register: _sites_for_delete
+      tags: [never, delete_site]
+
+    - name: "New Central | Build site_name -> scope_id map (delete)"
+      set_fact:
+        _site_scope_map: >-
+          {{ _sites_for_delete.sites
+             | items2dict(key_name='scopeName', value_name='scopeId') }}
+      tags: [never, delete_site]
+
+    - name: "New Central | Delete site"
+      workflow.aruba_central.central_site:
+        base_url: "{{ new_central_base_url }}"
+        client_id: "{{ central_client_id }}"
+        client_secret: "{{ central_client_secret }}"
+        state: absent
+        scope_id: "{{ _site_scope_map[item.site_name] }}"
+        site_name: "{{ item.site_name }}"
+      loop: "{{ target_sites }}"
+      loop_control:
+        label: "{{ item.site_name }}"
+      when: item.site_name in _site_scope_map
+      register: site_delete_results
+      tags: [never, delete_site]
+
+    - name: "New Central | Display site delete results"
+      debug:
+        msg: "{{ item.msg }}"
+      loop: "{{ site_delete_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.site_name }}"
+      when: site_delete_results.results is defined
+      tags: [never, delete_site]
+
+    # =========================================================================
+    # SAVE REFRESH TOKEN
+    # =========================================================================
+    - name: "Read new refresh token from temp file"
+      slurp:
+        src: "/tmp/.central_refresh_token"
+      register: _token_file
+      tags: [create_site]
+
+    - name: "Set new refresh token fact"
+      set_fact:
+        _new_refresh_token: "{{ _token_file.content | b64decode | trim }}"
+      tags: [create_site]
+
+    - name: "Vault | Decrypt vault.yml"
+      command: ansible-vault decrypt {{ vault_file }} --vault-password-file {{ vault_password_file }}
+      changed_when: false
+      when: vault_encrypted | bool
+      tags: [create_site]
+
+    - name: "Vault | Update classic_central_refresh_token in vault.yml"
+      replace:
+        path: "{{ vault_file }}"
+        regexp: '^classic_central_refresh_token:.*$'
+        replace: 'classic_central_refresh_token: "{{ _new_refresh_token }}"'
+      tags: [create_site]
+
+    - name: "Vault | Re-encrypt vault.yml"
+      command: ansible-vault encrypt {{ vault_file }} --vault-password-file {{ vault_password_file }}
+      changed_when: false
+      when: vault_encrypted | bool
+      tags: [create_site]

@@ -1,0 +1,229 @@
+---
+# =============================================================================
+# device_group_assignment.yml — Device Group Assignment
+# =============================================================================
+# Manages device-to-group assignments in Classic Central.
+#
+# Tags:
+#   [assign_group]   Move devices into their group  (serials optional)
+#   [unassign_group] Move devices back to default   (serials required)
+#
+# Usage:
+#   # Move all devices into their group
+#   ansible-playbook device_group_assignment.yml --tags assign_group
+#
+#   # Move a single device
+#   ansible-playbook device_group_assignment.yml --tags assign_group -e serials=SG03KW500G
+#
+#   # Move multiple devices
+#   ansible-playbook device_group_assignment.yml --tags assign_group -e "serials=SG03KW500G,SG3ALN0004"
+#
+#   # Move devices back to default group (serials required)
+#   ansible-playbook device_group_assignment.yml --tags unassign_group -e serials=SG03KW500G
+#   ansible-playbook device_group_assignment.yml --tags unassign_group -e "serials=SG03KW500G,CNQBLPQ0FF"
+# =============================================================================
+
+- name: HPE Aruba Classic Central — Device Group Assignment
+  hosts: localhost
+  gather_facts: false
+  connection: local
+
+  vars_files:
+    - vault.yml
+    - devices.yml
+
+  vars:
+    classic_central_base_url: "https://eu-apigw.central.arubanetworks.com"
+    vault_file:               "{{ playbook_dir }}/vault.yml"
+    vault_encrypted:          false
+    _serial_list: "{{ serials.split(',') | map('trim') | list if serials is defined else [] }}"
+    target_devices: >-
+      {{ devices | selectattr('serial_number', 'in', _serial_list) | list
+         if _serial_list | length > 0 else [] }}
+
+  tasks:
+
+    # =========================================================================
+    # ASSIGN DEVICE TO GROUP
+    # PRE-FLIGHT — Sync refresh token from file to var if available
+    # Prevents using a stale vault token when /tmp/.central_refresh_token exists
+    # =========================================================================
+    - name: "Classic Central | Check if token file exists"
+      stat:
+        path: "/tmp/.central_refresh_token"
+      register: _token_file_stat
+      tags: [assign_group]
+
+    - name: "Classic Central | Load token from file if available"
+      set_fact:
+        classic_central_refresh_token: "{{ lookup('file', '/tmp/.central_refresh_token') | trim }}"
+      when: _token_file_stat.stat.exists | default(false)
+      tags: [assign_group]
+
+    # =========================================================================
+    # Classic Central auth — single call, token reused for move
+    # serials optional — defaults to all devices if not specified
+    # =========================================================================
+    - name: "Classic Central | Query device groups"
+      workflow.aruba_central.central_device_group:
+        base_url: "{{ classic_central_base_url }}"
+        state: query
+        client_id: "{{ classic_central_client_id }}"
+        client_secret: "{{ classic_central_client_secret }}"
+        customer_id: "{{ classic_central_customer_id }}"
+        refresh_token: "{{ classic_central_refresh_token | default('') }}"
+        username: "{{ classic_central_username | default(omit) }}"
+        password: "{{ classic_central_password | default(omit) }}"
+      register: dg_query
+      tags: [assign_group]
+
+    - name: "Classic Central | Display existing groups"
+      debug:
+        msg: "{{ dg_query.total }} group(s) found: {{ dg_query.group_names }}"
+      tags: [assign_group]
+
+    - name: "Write device group assignment script"
+      copy:
+        dest: "/tmp/group_by_dg.py"
+        content: |
+          #!/usr/bin/env python3
+          import json
+          with open('/tmp/devices_dg.json') as f:
+              devices = json.load(f)
+          groups = {}
+          for d in devices:
+              dg = d.get('device_group')
+              if not dg:
+                  continue
+              groups.setdefault(dg, []).append(str(d['serial_number']))
+          result = [{'device_group': k, 'serials': v} for k, v in groups.items()]
+          print(json.dumps({'groups': result}))
+        mode: '0755'
+      tags: [assign_group]
+
+    - name: "Write devices to JSON for group assignment"
+      copy:
+        dest: "/tmp/devices_dg.json"
+        content: "{{ (target_devices if target_devices | length > 0 else devices) | to_json }}"
+      tags: [assign_group]
+
+    - name: "Run device group assignment script"
+      command: python3 /tmp/group_by_dg.py
+      register: dg_groups_raw
+      tags: [assign_group]
+
+    - name: "Set dg_groups fact"
+      set_fact:
+        dg_groups: "{{ (dg_groups_raw.stdout | from_json).groups }}"
+      tags: [assign_group]
+
+    - name: "Classic Central | Move devices to device group"
+      workflow.aruba_central.central_device_group:
+        base_url: "{{ classic_central_base_url }}"
+        state: move
+        client_id: "{{ classic_central_client_id }}"
+        client_secret: "{{ classic_central_client_secret }}"
+        customer_id: "{{ classic_central_customer_id }}"
+        refresh_token: "{{ lookup('file', '/tmp/.central_refresh_token') | default('') }}"
+        username: "{{ classic_central_username | default(omit) }}"
+        password: "{{ classic_central_password | default(omit) }}"
+        group_name: "{{ item.device_group }}"
+        device_serials: "{{ item.serials }}"
+      loop: "{{ dg_groups }}"
+      loop_control:
+        label: "{{ item.device_group }}"
+      register: dg_move_results
+      tags: [assign_group]
+
+    - name: "Display group assignment results"
+      debug:
+        msg: "{{ item.msg | default('skipped') }}"
+      loop: "{{ dg_move_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.device_group | default('?') }}"
+      tags: [assign_group]
+
+    # =========================================================================
+    # UNASSIGN DEVICE FROM GROUP
+    # Moves devices back to the 'default' group
+    # All tasks tagged never — must be called explicitly
+    # serials required — guard prevents accidental mass unassign
+    # Dedicated Classic Central auth call — independent from assign_group
+    # =========================================================================
+    - name: "Central | Assert serials is defined for unassign_group (safety check)"
+      assert:
+        that:
+          - serials is defined
+          - serials | length > 0
+        fail_msg: >-
+          ERROR: you must specify at least one device using -e serials=<SERIAL>[,<SERIAL>].
+          Example: ansible-playbook device_group_assignment.yml --tags unassign_group -e serials=SG03KW500G
+          This guard prevents accidentally moving all devices back to default group.
+        success_msg: "Target devices: {{ _serial_list | join(', ') }}"
+      tags: [never, unassign_group]
+
+    - name: "Classic Central | Query device groups for unassign"
+      workflow.aruba_central.central_device_group:
+        base_url: "{{ classic_central_base_url }}"
+        state: query
+        client_id: "{{ classic_central_client_id }}"
+        client_secret: "{{ classic_central_client_secret }}"
+        customer_id: "{{ classic_central_customer_id }}"
+        refresh_token: "{{ lookup('file', '/tmp/.central_refresh_token') | default('') }}"
+        username: "{{ classic_central_username | default(omit) }}"
+        password: "{{ classic_central_password | default(omit) }}"
+      register: _dg_query_unassign
+      tags: [never, unassign_group]
+
+    - name: "Classic Central | Move devices back to default group"
+      workflow.aruba_central.central_device_group:
+        base_url: "{{ classic_central_base_url }}"
+        state: move
+        client_id: "{{ classic_central_client_id }}"
+        client_secret: "{{ classic_central_client_secret }}"
+        customer_id: "{{ classic_central_customer_id }}"
+        refresh_token: "{{ lookup('file', '/tmp/.central_refresh_token') | default('') }}"
+        username: "{{ classic_central_username | default(omit) }}"
+        password: "{{ classic_central_password | default(omit) }}"
+        group_name: "default"
+        device_serials: "{{ target_devices | map(attribute='serial_number') | list }}"
+      tags: [never, unassign_group]
+      register: unassign_group_results
+
+    - name: "Display group unassignment results"
+      debug:
+        msg: "{{ unassign_group_results.msg | default('skipped') }}"
+      tags: [never, unassign_group]
+
+    # =========================================================================
+    # SAVE REFRESH TOKEN
+    # =========================================================================
+    - name: "Read new refresh token from temp file"
+      slurp:
+        src: "/tmp/.central_refresh_token"
+      register: _token_file
+      tags: [assign_group, unassign_group]
+
+    - name: "Set new refresh token fact"
+      set_fact:
+        _new_refresh_token: "{{ _token_file.content | b64decode | trim }}"
+      tags: [assign_group, unassign_group]
+
+    - name: "Vault | Decrypt vault.yml"
+      command: ansible-vault decrypt {{ vault_file }} --vault-password-file {{ vault_password_file }}
+      changed_when: false
+      when: vault_encrypted | bool
+      tags: [assign_group, unassign_group]
+
+    - name: "Vault | Update classic_central_refresh_token in vault.yml"
+      replace:
+        path: "{{ vault_file }}"
+        regexp: '^classic_central_refresh_token:.*$'
+        replace: 'classic_central_refresh_token: "{{ _new_refresh_token }}"'
+      tags: [assign_group, unassign_group]
+
+    - name: "Vault | Re-encrypt vault.yml"
+      command: ansible-vault encrypt {{ vault_file }} --vault-password-file {{ vault_password_file }}
+      changed_when: false
+      when: vault_encrypted | bool
+      tags: [assign_group, unassign_group]

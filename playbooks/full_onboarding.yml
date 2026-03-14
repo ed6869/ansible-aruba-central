@@ -1,0 +1,513 @@
+---
+# =============================================================================
+# full_onboarding.yml — HPE Aruba Full Device Onboarding
+# =============================================================================
+# Performs the complete onboarding sequence for one, several, or all devices:
+#
+#   Phase 1 — GLP
+#     Add device to GLP workspace
+#     Assign device to HPE Aruba Networking Central application
+#     Apply subscription license
+#
+#   Phase 2 — Classic Central
+#     Create site (idempotent)
+#     Associate device to site
+#     Create device group (idempotent)
+#     Move device to device group
+#
+#   Phase 3 — New Central
+#     Assign device persona
+#
+# Usage:
+#   # All devices
+#   ansible-playbook full_onboarding.yml
+#
+#   # Single device
+#   ansible-playbook full_onboarding.yml -e serials=SG03KW500G
+#
+#   # Multiple devices
+#   ansible-playbook full_onboarding.yml -e "serials=SG03KW500G,SG3ALN0004"
+#
+# For post-onboarding operations (assign/unassign app, sub, site, group):
+#   use the dedicated management playbooks.
+# =============================================================================
+
+- name: HPE Aruba Full Device Onboarding
+  hosts: localhost
+  gather_facts: false
+  connection: local
+
+  vars_files:
+    - vault.yml
+    - devices.yml
+    - device_groups.yml
+    - sites.yml
+
+  vars:
+    glp_api_url:              "https://global.api.greenlake.hpe.com"
+    new_central_base_url:     "https://de1.api.central.arubanetworks.com"
+    classic_central_base_url: "https://eu-apigw.central.arubanetworks.com"
+    vault_file:               "{{ playbook_dir }}/vault.yml"
+    vault_encrypted:          false
+    _serial_list: "{{ serials.split(',') | map('trim') | list if serials is defined else [] }}"
+    target_devices: >-
+      {{ devices | selectattr('serial_number', 'in', _serial_list) | list
+         if _serial_list | length > 0 else [] }}
+    _site_list: "{{ site_names.split(',') | map('trim') | list if site_names is defined else [] }}"
+    target_sites: >-
+      {{ sites | selectattr('site_name', 'in', _site_list) | list
+         if _site_list | length > 0 else sites }}
+
+  tasks:
+
+    # =========================================================================
+    # PRE-FLIGHT — Sync refresh token from file to var if available
+    # Prevents using a stale vault token when /tmp/.central_refresh_token exists
+    # =========================================================================
+    - name: "Classic Central | Check if token file exists"
+      stat:
+        path: "/tmp/.central_refresh_token"
+      register: _token_file_stat
+
+    - name: "Classic Central | Load token from file if available"
+      set_fact:
+        classic_central_refresh_token: "{{ lookup('file', '/tmp/.central_refresh_token') | trim }}"
+      when: _token_file_stat.stat.exists | default(false)
+
+    # =========================================================================
+    # SUMMARY
+    # =========================================================================
+    - name: "Display devices to onboard"
+      debug:
+        msg: "Device: {{ item.serial_number }} | Type: {{ item.device_type }} | Site: {{ item.site }} | Group: {{ item.device_group }} | Persona: {{ item.persona }}"
+      loop: "{{ target_devices if target_devices | length > 0 else devices }}"
+      loop_control:
+        label: "{{ item.serial_number }}"
+
+    # =========================================================================
+    # GLP — Add device + assign app + assign subscription
+    # =========================================================================
+    - name: "GLP | Add device to workspace"
+      workflow.aruba_central.glp_device:
+        base_url: "{{ glp_api_url }}"
+        client_id: "{{ central_client_id }}"
+        client_secret: "{{ central_client_secret }}"
+        state: present
+        serial_number: "{{ item.serial_number }}"
+        mac_address: "{{ item.mac_address }}"
+      loop: "{{ target_devices if target_devices | length > 0 else devices }}"
+      loop_control:
+        label: "{{ item.serial_number }}"
+      register: glp_device_results
+
+    - name: "GLP | Display device add results"
+      debug:
+        msg: "{{ item.msg }}"
+      loop: "{{ glp_device_results.results }}"
+      loop_control:
+        label: "{{ item.serial_number }}"
+
+    - name: "GLP | Build device UUID map"
+      set_fact:
+        device_uuid_map: >-
+          {{ device_uuid_map | default({}) | combine({
+            item.serial_number: item.device_id
+          }) }}
+      loop: "{{ glp_device_results.results }}"
+      loop_control:
+        label: "{{ item.serial_number }}"
+
+    - name: "GLP | Assign Central application to device"
+      workflow.aruba_central.glp_application:
+        base_url: "{{ glp_api_url }}"
+        client_id: "{{ central_client_id }}"
+        client_secret: "{{ central_client_secret }}"
+        state: present
+        device_id: "{{ device_uuid_map[item.serial_number] }}"
+        serial_number: "{{ item.serial_number }}"
+        application_id: "{{ glp_central_sm_id }}"
+        region: "{{ item.glp.region }}"
+        retries: 10
+        delay: 5
+      loop: "{{ target_devices if target_devices | length > 0 else devices }}"
+      loop_control:
+        label: "{{ item.serial_number }}"
+      register: glp_app_results
+
+    - name: "GLP | Display application assignment results"
+      debug:
+        msg: "{{ item.msg }}"
+      loop: "{{ glp_app_results.results }}"
+      loop_control:
+        label: "{{ item.serial_number }}"
+
+    - name: "GLP | Assign subscription to device"
+      workflow.aruba_central.glp_license:
+        base_url: "{{ glp_api_url }}"
+        client_id: "{{ central_client_id }}"
+        client_secret: "{{ central_client_secret }}"
+        state: present
+        device_id: "{{ device_uuid_map[item.serial_number] }}"
+        serial_number: "{{ item.serial_number }}"
+        subscription_key: "{{ item.glp.subscription_key }}"
+        retries: 10
+        delay: 5
+      loop: "{{ target_devices if target_devices | length > 0 else devices }}"
+      loop_control:
+        label: "{{ item.serial_number }}"
+      register: glp_license_results
+
+    - name: "GLP | Display subscription assignment results"
+      debug:
+        msg: "{{ item.msg }}"
+      loop: "{{ glp_license_results.results }}"
+      loop_control:
+        label: "{{ item.serial_number }}"
+
+    # =========================================================================
+    # CLASSIC CENTRAL — SINGLE AUTH CALL
+    # One login for the entire playbook — token written to /tmp/.central_refresh_token
+    # All subsequent Classic Central tasks use the file token (never vault token again)
+    # =========================================================================
+    - name: "Classic Central | Auth + Query sites"
+      workflow.aruba_central.central_site_devices:
+        base_url: "{{ classic_central_base_url }}"
+        state: query
+        client_id: "{{ classic_central_client_id }}"
+        client_secret: "{{ classic_central_client_secret }}"
+        customer_id: "{{ classic_central_customer_id }}"
+        refresh_token: "{{ classic_central_refresh_token | default('') }}"
+        username: "{{ classic_central_username | default(omit) }}"
+        password: "{{ classic_central_password | default(omit) }}"
+      register: sites_query
+
+    - name: "Classic Central | Build site name -> site_id lookup"
+      set_fact:
+        classic_site_id_map: "{{ sites_query.sites | items2dict(key_name='site_name', value_name='site_id') }}"
+
+    - name: "Classic Central | Display site lookup map"
+      debug:
+        msg: "Site map: {{ classic_site_id_map }}"
+
+    # =========================================================================
+    # CREATE SITE (idempotent — skips existing sites)
+    # =========================================================================
+    - name: "Classic Central | Build site details lookup from sites.yml"
+      set_fact:
+        site_details_map: >-
+          {{ site_details_map | default({}) | combine({item.site_name: item}) }}
+      loop: "{{ target_sites }}"
+      loop_control:
+        label: "{{ item.site_name }}"
+
+    - name: "Classic Central | Create site (if not exists)"
+      workflow.aruba_central.central_site:
+        base_url: "{{ new_central_base_url }}"
+        client_id: "{{ central_client_id }}"
+        client_secret: "{{ central_client_secret }}"
+        state: present
+        site_name: "{{ item.site_name }}"
+        address: "{{ item.address | default(omit) }}"
+        city: "{{ item.city | default(omit) }}"
+        state_region: "{{ item.state_region | default(omit) }}"
+        country: "{{ item.country | default(omit) }}"
+        zip_code: "{{ item.zip_code | default(omit) }}"
+        timezone: "{{ item.timezone | default('UTC') }}"
+        latitude: "{{ item.latitude | default(omit) }}"
+        longitude: "{{ item.longitude | default(omit) }}"
+      loop: "{{ target_sites }}"
+      loop_control:
+        label: "{{ item.site_name }}"
+      when: item.site_name not in classic_site_id_map
+      register: site_create_results
+
+    - name: "Classic Central | Display site creation results"
+      debug:
+        msg: "{{ item.msg | default('skipped') }}"
+      loop: "{{ site_create_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item | default('') }}"
+      when: site_create_results.results is defined and item.msg is defined
+
+    # Re-query only if at least one site was actually created
+    - name: "Classic Central | Re-query sites after creation"
+      workflow.aruba_central.central_site_devices:
+        base_url: "{{ classic_central_base_url }}"
+        state: query
+        client_id: "{{ classic_central_client_id }}"
+        client_secret: "{{ classic_central_client_secret }}"
+        customer_id: "{{ classic_central_customer_id }}"
+        refresh_token: "{{ lookup('file', '/tmp/.central_refresh_token') | default('') }}"
+        username: "{{ classic_central_username | default(omit) }}"
+        password: "{{ classic_central_password | default(omit) }}"
+      register: sites_query
+      when: site_create_results.results | default([]) | selectattr('changed', 'equalto', true) | list | length > 0
+
+    - name: "Classic Central | Rebuild site name -> site_id lookup"
+      set_fact:
+        classic_site_id_map: "{{ sites_query.sites | items2dict(key_name='site_name', value_name='site_id') }}"
+      when: site_create_results.results | default([]) | selectattr('changed', 'equalto', true) | list | length > 0
+
+    # =========================================================================
+    # ASSIGN DEVICE TO SITE
+    # =========================================================================
+    - name: "Write device site grouping script"
+      copy:
+        dest: "/tmp/group_devices_site.py"
+        content: |
+          #!/usr/bin/env python3
+          import json
+          with open('/tmp/devices_site.json') as f:
+              devices = json.load(f)
+          dtype_map = {'AP': 'IAP', 'SWITCH': 'SWITCH', 'GATEWAY': 'CONTROLLER'}
+          groups = {}
+          for d in devices:
+              dtype = dtype_map.get(d['device_type'], d['device_type'])
+              key = (d['site'], dtype)
+              groups.setdefault(key, []).append(str(d['serial_number']))
+          result = [{'site': k[0], 'device_type': k[1], 'serials': v} for k, v in groups.items()]
+          print(json.dumps({'groups': result}))
+        mode: '0755'
+
+    - name: "Write devices to JSON for site grouping"
+      copy:
+        dest: "/tmp/devices_site.json"
+        content: "{{ (target_devices if target_devices | length > 0 else devices) | to_json }}"
+
+    - name: "Run site grouping script"
+      command: python3 /tmp/group_devices_site.py
+      register: site_groups_raw
+
+    - name: "Set site_device_groups fact"
+      set_fact:
+        site_device_groups: "{{ (site_groups_raw.stdout | from_json).groups }}"
+
+    - name: "Classic Central | Associate devices to site"
+      workflow.aruba_central.central_site_devices:
+        base_url: "{{ classic_central_base_url }}"
+        state: present
+        client_id: "{{ classic_central_client_id }}"
+        client_secret: "{{ classic_central_client_secret }}"
+        customer_id: "{{ classic_central_customer_id }}"
+        refresh_token: "{{ lookup('file', '/tmp/.central_refresh_token') | default('') }}"
+        username: "{{ classic_central_username | default(omit) }}"
+        password: "{{ classic_central_password | default(omit) }}"
+        site_id: "{{ classic_site_id_map[item.site] }}"
+        site_name: "{{ item.site }}"
+        device_type: "{{ item.device_type }}"
+        device_serials: "{{ item.serials }}"
+      loop: "{{ site_device_groups }}"
+      loop_control:
+        label: "{{ item.site }} | {{ item.device_type }}"
+      register: assign_site_results
+
+    - name: "Display site assignment results"
+      debug:
+        msg: "{{ item.msg | default('skipped') }}"
+      loop: "{{ assign_site_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.site | default('?') }}"
+
+    # =========================================================================
+    # SET DEVICE PERSONA
+    # =========================================================================
+    - name: "Write device persona grouping script"
+      copy:
+        dest: "/tmp/group_personas_full.py"
+        content: |
+          #!/usr/bin/env python3
+          import json
+          with open('/tmp/devices_persona.json') as f:
+              devices = json.load(f)
+          groups = {}
+          for d in devices:
+              persona = d.get('persona')
+              if not persona:
+                  continue
+              groups.setdefault(persona, []).append(str(d['serial_number']))
+          result = [{'persona': k, 'serials': v} for k, v in groups.items()]
+          print(json.dumps({'groups': result}))
+        mode: '0755'
+
+    - name: "Write devices to JSON for persona grouping"
+      copy:
+        dest: "/tmp/devices_persona.json"
+        content: "{{ (target_devices if target_devices | length > 0 else devices) | to_json }}"
+
+    - name: "Run persona grouping script"
+      command: python3 /tmp/group_personas_full.py
+      register: persona_groups_raw
+
+    - name: "Set persona_groups fact"
+      set_fact:
+        persona_groups: "{{ (persona_groups_raw.stdout | from_json).groups }}"
+
+    - name: "New Central | Assign device persona"
+      workflow.aruba_central.central_device_persona:
+        base_url: "{{ new_central_base_url }}"
+        client_id: "{{ central_client_id }}"
+        client_secret: "{{ central_client_secret }}"
+        device_serials: "{{ item.serials }}"
+        persona: "{{ item.persona }}"
+      loop: "{{ persona_groups }}"
+      loop_control:
+        label: "{{ item.persona }}"
+      register: persona_results
+
+    - name: "Display persona assignment results"
+      debug:
+        msg: "{{ item.msg }}"
+      loop: "{{ persona_results.results }}"
+      loop_control:
+        label: "{{ item.item.persona }}"
+
+    # =========================================================================
+    # CREATE DEVICE GROUP (idempotent — skips existing groups)
+    # Token already refreshed by Auth + Query sites above — no new login needed
+    # =========================================================================
+    - name: "Classic Central | Query device groups"
+      workflow.aruba_central.central_device_group:
+        base_url: "{{ classic_central_base_url }}"
+        state: query
+        client_id: "{{ classic_central_client_id }}"
+        client_secret: "{{ classic_central_client_secret }}"
+        customer_id: "{{ classic_central_customer_id }}"
+        refresh_token: "{{ lookup('file', '/tmp/.central_refresh_token') | default('') }}"
+        username: "{{ classic_central_username | default(omit) }}"
+        password: "{{ classic_central_password | default(omit) }}"
+      register: dg_query
+
+    - name: "Classic Central | Create device group (if not exists)"
+      workflow.aruba_central.central_device_group:
+        base_url: "{{ classic_central_base_url }}"
+        state: present
+        client_id: "{{ classic_central_client_id }}"
+        client_secret: "{{ classic_central_client_secret }}"
+        customer_id: "{{ classic_central_customer_id }}"
+        refresh_token: "{{ lookup('file', '/tmp/.central_refresh_token') | default('') }}"
+        username: "{{ classic_central_username | default(omit) }}"
+        password: "{{ classic_central_password | default(omit) }}"
+        group_name: "{{ item.name }}"
+        allowed_dev_types: "{{ item.allowed_dev_types | default(['AccessPoints', 'Gateways', 'Switches']) }}"
+        allowed_switch_types: "{{ item.allowed_switch_types | default(['AOS_CX']) }}"
+        architecture: "{{ item.architecture | default('AOS10') }}"
+        ap_network_role: "{{ item.ap_network_role | default('Standard') }}"
+        gw_network_role: "{{ item.gw_network_role | default('WLANGateway') }}"
+        template_wired: "{{ item.template_wired | default(false) }}"
+        template_wireless: "{{ item.template_wireless | default(false) }}"
+        new_central: "{{ item.new_central | default(true) }}"
+      loop: "{{ device_groups }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: dg_create_results
+
+    - name: "Display device group creation results"
+      debug:
+        msg: "{{ item.msg }}"
+      loop: "{{ dg_create_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    # =========================================================================
+    # ASSIGN DEVICE TO DEVICE GROUP
+    # =========================================================================
+    - name: "Write device group assignment script"
+      copy:
+        dest: "/tmp/group_by_dg_full.py"
+        content: |
+          #!/usr/bin/env python3
+          import json
+          with open('/tmp/devices_dg_full.json') as f:
+              devices = json.load(f)
+          groups = {}
+          for d in devices:
+              dg = d.get('device_group')
+              if not dg:
+                  continue
+              groups.setdefault(dg, []).append(str(d['serial_number']))
+          result = [{'device_group': k, 'serials': v} for k, v in groups.items()]
+          print(json.dumps({'groups': result}))
+        mode: '0755'
+
+    - name: "Write devices to JSON for group assignment"
+      copy:
+        dest: "/tmp/devices_dg_full.json"
+        content: "{{ (target_devices if target_devices | length > 0 else devices) | to_json }}"
+
+    - name: "Run device group assignment script"
+      command: python3 /tmp/group_by_dg_full.py
+      register: dg_groups_raw
+
+    - name: "Set dg_groups fact"
+      set_fact:
+        dg_groups: "{{ (dg_groups_raw.stdout | from_json).groups }}"
+
+    - name: "Classic Central | Move devices to device group"
+      workflow.aruba_central.central_device_group:
+        base_url: "{{ classic_central_base_url }}"
+        state: move
+        client_id: "{{ classic_central_client_id }}"
+        client_secret: "{{ classic_central_client_secret }}"
+        customer_id: "{{ classic_central_customer_id }}"
+        refresh_token: "{{ lookup('file', '/tmp/.central_refresh_token') | default('') }}"
+        username: "{{ classic_central_username | default(omit) }}"
+        password: "{{ classic_central_password | default(omit) }}"
+        group_name: "{{ item.device_group }}"
+        device_serials: "{{ item.serials }}"
+      loop: "{{ dg_groups }}"
+      loop_control:
+        label: "{{ item.device_group }}"
+      register: dg_move_results
+
+    - name: "Display device group assignment results"
+      debug:
+        msg: "{{ item.msg }}"
+      loop: "{{ dg_move_results.results }}"
+      loop_control:
+        label: "{{ item.item.device_group }}"
+
+    # =========================================================================
+    # SAVE REFRESH TOKEN
+    # =========================================================================
+    - name: "Read new refresh token from temp file"
+      slurp:
+        src: "/tmp/.central_refresh_token"
+      register: _token_file
+
+    - name: "Set new refresh token fact"
+      set_fact:
+        _new_refresh_token: "{{ _token_file.content | b64decode | trim }}"
+
+    - name: "Vault | Decrypt vault.yml"
+      command: ansible-vault decrypt {{ vault_file }} --vault-password-file {{ vault_password_file }}
+      changed_when: false
+      when: vault_encrypted | bool
+
+    - name: "Vault | Update classic_central_refresh_token in vault.yml"
+      replace:
+        path: "{{ vault_file }}"
+        regexp: '^classic_central_refresh_token:.*$'
+        replace: 'classic_central_refresh_token: "{{ _new_refresh_token }}"'
+
+    - name: "Vault | Re-encrypt vault.yml"
+      command: ansible-vault encrypt {{ vault_file }} --vault-password-file {{ vault_password_file }}
+      changed_when: false
+      when: vault_encrypted | bool
+
+    # =========================================================================
+    # FINAL SUMMARY
+    # =========================================================================
+    - name: "Full onboarding complete"
+      debug:
+        msg:
+          - "================================================"
+          - "Device  : {{ item.serial_number }}"
+          - "Type    : {{ item.device_type }}"
+          - "Persona : {{ item.persona }}"
+          - "Site    : {{ item.site }}"
+          - "Group   : {{ item.device_group }}"
+          - "Status  : DONE"
+          - "================================================"
+      loop: "{{ target_devices if target_devices | length > 0 else devices }}"
+      loop_control:
+        label: "{{ item.serial_number }}"
