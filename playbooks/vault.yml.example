@@ -1,0 +1,35 @@
+---
+# =============================================================================
+# vault.yml.example — Credentials template
+# =============================================================================
+# Copy this file to vault.yml and fill in your values.
+# Then encrypt it with: ansible-vault encrypt vault.yml
+# Run playbooks with: ansible-playbook <playbook>.yml --ask-vault-pass
+# =============================================================================
+
+# ── GLP / New Central ──────────────────────────────────────────────────────────
+# How to get these: GLP portal → Manage → API Clients
+# Permissions required: Devices R/W, Subscriptions R, Service catalog R
+central_client_id: "<your-glp-client-id>"
+central_client_secret: "<your-glp-client-secret>"
+
+# Service Manager ID of your Central workspace in GLP
+# GLP → Workspace → Services → click "HPE Aruba Networking Central" → ID is in the URL
+glp_central_sm_id: "<your-glp-sm-id>"
+
+# ── Classic Central ────────────────────────────────────────────────────────────
+# How to get these: Aruba Central → Maintenance → API Gateway → System Apps & Tokens
+# Reference: https://developer.arubanetworks.com/central/docs/api-oauth-access-token
+classic_central_client_id: "<your-classic-client-id>"
+classic_central_client_secret: "<your-classic-client-secret>"
+
+# Classic Central → Global Settings → Customer ID
+classic_central_customer_id: "<your-customer-id>"
+
+# User account used as fallback if the refresh token has expired
+classic_central_username: "admin@yourcompany.com"
+classic_central_password: "<your-password>"
+
+# Single-use refresh token — automatically updated after each run
+# Leave empty on first run, it will be initialized automatically
+classic_central_refresh_token: ""
